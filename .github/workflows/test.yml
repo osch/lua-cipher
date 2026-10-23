@@ -1,0 +1,182 @@
+name: test
+
+on: [push, workflow_dispatch]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        luaVersion: ["5.1", "5.2", "5.3", "5.4", "5.5", "luajit"]
+        exclude:
+          # LuaJIT on Windows can't find the Lua library when building C
+          # modules with gh-actions-lua, so skip it there.
+          - os: windows-latest
+            luaVersion: luajit
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - uses: ./.github/actions/msvc-dev-env
+      if: runner.os == 'Windows'
+
+    - name: remove conflicting Git link.exe (Windows)
+      # Git for Windows ships a coreutils "link" (hardlink tool) in usr/bin
+      # that shadows MSVC's link.exe under the bash shell used below.
+      if: runner.os == 'Windows'
+      shell: bash
+      run: rm -f "/usr/bin/link.exe"
+
+    - name: install comparison tools (Linux)
+      # no library is needed for building; these are the other AES, RC4, ChaCha20
+      # and DES implementations that test04 compares with (openssl is on the runner)
+      # (refresh the package lists first: the runner image's lists go stale, and
+      #  a superseded package version is no longer on the mirror -> 404)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y python3-cryptography python3-pycryptodome libcryptx-perl libcrypt-rijndael-perl libcrypt-cbc-perl libcrypt-rc4-perl libcrypt-des-perl libcrypt-des-ede3-perl
+
+    - uses: luarocks/gh-actions-lua@v14
+      with:
+        luaVersion: ${{ matrix.luaVersion }}
+
+    - uses: luarocks/gh-actions-luarocks@v7
+
+    - name: setup
+      shell: bash
+      run: |
+        luarocks install carray
+        luarocks make tests/cipher_multistate-scm-0.rockspec
+        luarocks make tests/cipher_testcarray-scm-0.rockspec
+        # each module rock on its own, then the meta rock that depends on all of them
+        luarocks make rockspecs/cipher.aes-scm-0.rockspec
+        luarocks make rockspecs/cipher.rc4-scm-0.rockspec
+        luarocks make rockspecs/cipher.chacha20-scm-0.rockspec
+        luarocks make rockspecs/cipher.des-scm-0.rockspec
+        luarocks make rockspecs/cipher-scm-0.rockspec
+
+    - name: test
+      shell: bash
+      env:
+        # Linux: all comparisons of test04 must run (the tools are installed above);
+        # macOS and Windows: whatever is there, the rest is skipped
+        AES_REQUIRE: ${{ runner.os == 'Linux' && 'openssl,cryptography,pycryptodome,cryptx,rijndael,cbc' || '' }}
+        RC4_REQUIRE: ${{ runner.os == 'Linux' && 'openssl,cryptography,pycryptodome,rc4,cryptx' || '' }}
+        CHACHA20_REQUIRE: ${{ runner.os == 'Linux' && 'openssl,cryptography,pycryptodome,cryptx' || '' }}
+        DES_REQUIRE: ${{ runner.os == 'Linux' && 'openssl,cryptography,pycryptodome,cryptx,des,cbc' || '' }}
+        # the native Windows Perl (Strawberry, with CryptX), not the Perl of Git for Windows
+        CIPHER_TEST_PERL: ${{ runner.os == 'Windows' && 'C:/Strawberry/perl/bin/perl.exe' || '' }}
+      run: |
+        set -e
+        [ -n "$CIPHER_TEST_PERL" ] || unset CIPHER_TEST_PERL
+        lua -v
+        cd tests/cipher
+        lua test01.lua
+        cd ../aes
+        lua test01.lua
+        lua test02.lua
+        lua test03.lua
+        CIPHER_TEST_REQUIRE="$AES_REQUIRE" lua test04.lua
+        cd ../rc4
+        lua test01.lua
+        lua test02.lua
+        lua test03.lua
+        CIPHER_TEST_REQUIRE="$RC4_REQUIRE" lua test04.lua
+        cd ../chacha20
+        lua test01.lua
+        lua test02.lua
+        lua test03.lua
+        CIPHER_TEST_REQUIRE="$CHACHA20_REQUIRE" lua test04.lua
+        cd ../des
+        lua test01.lua
+        lua test02.lua
+        lua test03.lua
+        CIPHER_TEST_REQUIRE="$DES_REQUIRE" lua test04.lua
+        cd ../../examples
+        lua example01.lua
+        lua aes01.lua
+        lua rc4_01.lua
+        lua chacha20_01.lua
+        lua des01.lua
+
+  # Windows with MinGW-w64 (gcc, MSYS2 UCRT64): Lua and LuaRocks come from
+  # MSYS2's packages, so this also checks the build with gcc on Windows.
+  test-mingw:
+    strategy:
+      fail-fast: false
+      matrix:
+        luaVersion: ["5.4"]
+
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: true
+        install: >-
+          mingw-w64-ucrt-x86_64-gcc
+          mingw-w64-ucrt-x86_64-lua
+          mingw-w64-ucrt-x86_64-lua-luarocks
+          mingw-w64-ucrt-x86_64-openssl
+
+    - name: setup
+      run: |
+        set -e
+        lua -v
+        luarocks --version
+        luarocks config
+        luarocks install carray
+        luarocks make tests/cipher_multistate-scm-0.rockspec
+        luarocks make tests/cipher_testcarray-scm-0.rockspec
+        # each module rock on its own, then the meta rock that depends on all of them
+        luarocks make rockspecs/cipher.aes-scm-0.rockspec
+        luarocks make rockspecs/cipher.rc4-scm-0.rockspec
+        luarocks make rockspecs/cipher.chacha20-scm-0.rockspec
+        luarocks make rockspecs/cipher.des-scm-0.rockspec
+        luarocks make rockspecs/cipher-scm-0.rockspec
+
+    - name: test
+      env:
+        # a native Windows Perl (Strawberry, with CryptX)
+        CIPHER_TEST_PERL: C:/Strawberry/perl/bin/perl.exe
+      run: |
+        set -e
+        cd tests/cipher
+        lua test01.lua
+        cd ../aes
+        lua test01.lua
+        lua test02.lua
+        lua test03.lua
+        lua test04.lua
+        cd ../rc4
+        lua test01.lua
+        lua test02.lua
+        lua test03.lua
+        lua test04.lua
+        cd ../chacha20
+        lua test01.lua
+        lua test02.lua
+        lua test03.lua
+        lua test04.lua
+        cd ../des
+        lua test01.lua
+        lua test02.lua
+        lua test03.lua
+        lua test04.lua
+        cd ../../examples
+        lua example01.lua
+        lua aes01.lua
+        lua rc4_01.lua
+        lua chacha20_01.lua
+        lua des01.lua
